@@ -256,12 +256,16 @@ def send_pushover(message: str, title: str = "Portad dashboard update") -> None:
         "priority": 0,
     }
     try:
-        requests.post(
+        resp = requests.post(
             "https://api.pushover.net/1/messages.json", data=payload, timeout=10
         )
-    except Exception:
-        # non-fatal
-        pass
+        if resp.status_code != 200:
+            sys.stderr.write(
+                f"Pushover failed ({resp.status_code}): {resp.text[:200]}\n"
+            )
+    except Exception as exc:
+        # non-fatal, but keep a trace
+        sys.stderr.write(f"Pushover error: {exc}\n")
 
 
 def notify_error(exc: Exception) -> None:
