@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from pathlib import Path
 from collections import deque
+import argparse
 
 
 BASE_URL = "https://portad.laya.fr/"
@@ -269,7 +270,45 @@ def notify_error(exc: Exception) -> None:
     sys.stderr.write(msg + "\n")
 
 
+def summarize_changes(prev: dict | None, curr: dict) -> str:
+    if prev is None:
+        return "Première capture enregistrée."
+
+    lines: List[str] = []
+    # Tiles comparison
+    prev_tiles = {t.get("label", f"tile{idx}"): t for idx, t in enumerate(prev.get("tiles", []))}
+    curr_tiles = {t.get("label", f"tile{idx}"): t for idx, t in enumerate(curr.get("tiles", []))}
+    for label, ct in curr_tiles.items():
+        pv = prev_tiles.get(label, {})
+        if pv.get("value") != ct.get("value"):
+            lines.append(f"📊 {label or 'Tile'} : {pv.get('value','-')} -> {ct.get('value','-')}")
+    # Table count / headings
+    prev_heads = [t.get("heading") for t in prev.get("tables", [])]
+    curr_heads = [t.get("heading") for t in curr.get("tables", [])]
+    if prev_heads != curr_heads:
+        lines.append("🗂️ Structure des tableaux modifiée.")
+    # Rows count per heading
+    prev_map = {t.get("heading"): len(t.get("rows", [])) for t in prev.get("tables", [])}
+    curr_map = {t.get("heading"): len(t.get("rows", [])) for t in curr.get("tables", [])}
+    for h, n in curr_map.items():
+        if h in prev_map and prev_map[h] != n:
+            lines.append(f"📄 {h or 'Table'} : {prev_map[h]} lignes -> {n} lignes")
+
+    if not lines:
+        lines.append("Changements détectés (détails non résumés).")
+    # Limit to a few lines for notification readability
+    return "\n".join(lines[:6])
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Fetch LAYA dashboard.")
+    parser.add_argument(
+        "--simulate-change",
+        action="store_true",
+        help="Force un changement fictif pour tester la notif",
+    )
+    args = parser.parse_args()
+
     load_env_file()
 
     username = os.getenv("PORTAD_USER", DEFAULT_USER)
@@ -303,6 +342,9 @@ def main() -> int:
                 "tables": parse_two_col_tables(soup),
             }
 
+            if args.simulate_change:
+                data["__simulated_change"] = datetime.now().isoformat()
+
             # Diff & notify
             previous = load_last_snapshot()
             changed = previous is None or diff_changed(previous, data)
@@ -311,8 +353,10 @@ def main() -> int:
                 snap_path = save_snapshot(data)
                 cleanup_old_snapshots()
                 if previous is not None:
+                    summary = summarize_changes(previous, data)
                     send_pushover(
-                        f"Changement détecté sur le tableau de bord. Snapshot: {snap_path.name}"
+                        f"{summary}\n📁 {snap_path.name}",
+                        title="📈 Portad: changement détecté",
                     )
             else:
                 # keep last_snapshot as-is; ensure at least baseline exists
