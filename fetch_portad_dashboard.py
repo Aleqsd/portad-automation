@@ -432,14 +432,29 @@ def summarize_changes(prev: dict | None, curr: dict) -> str:
             f"👤 user_id : {_format_value(prev.get('user_id'))} -> {_format_value(curr.get('user_id'))}"
         )
 
-    if not lines:
-        diff = _first_diff(prev, curr)
-        if diff:
-            path, before, after = diff
-            lines.append(f"Δ {path} : {_format_value(before)} -> {_format_value(after)}")
-        else:
-            lines.append("Changements détectés.")
-    return "\n".join(lines[:6])
+    # Always surface the first value-level delta so the notification shows a before/after,
+    # even when higher-level counters (row counts, tiles) already generated lines.
+    diff = _first_diff(prev, curr)
+    if diff:
+        path, before, after = diff
+        diff_line = f"Δ {path} : {_format_value(before)} -> {_format_value(after)}"
+        if diff_line not in lines:
+            lines.insert(0, diff_line)
+    elif not lines:
+        lines.append("Changements détectés.")
+
+    return "\n".join(lines[:7])
+
+
+def build_notification_message(summary: str, snap_path: Path | None) -> str:
+    """Normalize and trim the notification payload shown by Pushover."""
+    summary_lines = [line.strip() for line in summary.splitlines() if line.strip()]
+    if not summary_lines:
+        summary_lines = ["Changement détecté (détails indisponibles)."]
+    if snap_path is not None:
+        summary_lines.append(f"📁 {snap_path.name}")
+    message = "\n".join(summary_lines)
+    return message[:1024]  # Pushover message limit is 1024 chars
 
 
 def _atomic_dump_json(path: Path, data: dict, gzip_compress: bool = False) -> None:
@@ -522,10 +537,8 @@ def main() -> int:
                 cleanup_old_snapshots()
                 if previous is not None:
                     summary = summarize_changes(previous, data)
-                    send_pushover(
-                        f"{summary}\n📁 {snap_path.name}",
-                        title="📈 Portad: changement détecté",
-                    )
+                    message = build_notification_message(summary, snap_path)
+                    send_pushover(message, title="📈 Portad: changement détecté")
             else:
                 # keep last_snapshot as-is; ensure at least baseline exists
                 if previous is None:

@@ -233,6 +233,18 @@ class SummarizeChangesTests(unittest.TestCase):
         self.assertIn("1 lignes -> 3 lignes", summary)
 
 
+class NotificationMessageTests(unittest.TestCase):
+    def test_build_notification_message_uses_fallback_when_summary_blank(self):
+        msg = fpd.build_notification_message("   \n", Path("portad-dashboard-123.json.gz"))
+        self.assertIn("Changement détecté", msg)
+        self.assertIn("portad-dashboard-123.json.gz", msg)
+
+    def test_build_notification_message_trims_and_preserves_lines(self):
+        summary = "  A -> B  \n\nC -> D"
+        msg = fpd.build_notification_message(summary, None)
+        self.assertEqual(msg, "A -> B\nC -> D")
+
+
 class SessionAndAuthTests(unittest.TestCase):
     def test_build_session_sets_user_agent_and_retries(self):
         session = fpd.build_session()
