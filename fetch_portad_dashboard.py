@@ -5,23 +5,24 @@ Fetch and parse the LAYA dashboard (display-tableau) once using requests + Beaut
 Usage:
     PORTAD_USER=you@example.com PORTAD_PASS=secret .venv/bin/python fetch_portad_dashboard.py
 
-Defaults fall back to the credentials provided by the user for convenience.
+Environment variables (or a .env file) must define credentials.
 """
 
 from __future__ import annotations
 
+import argparse
+import gzip
 import json
 import os
 import sys
-import gzip
-from typing import Dict, List
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
 
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
-from pathlib import Path
-from collections import deque
-import argparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 BASE_URL = "https://portad.laya.fr/"
@@ -29,14 +30,12 @@ LOGIN_URL = BASE_URL + "?ext=loginpage&controller=ext&action=login"
 DISPLAY_TABLEAU_PAGE = BASE_URL + "index.php?new=1&id=display-tableau"
 AJAX_PERSON_URL = BASE_URL + "index.php?ext=contact&controller=person"
 
-# Fallback credentials; prefer using environment variables to avoid hard‑coding secrets.
-DEFAULT_USER = "aleqsd@gmail.com"
-DEFAULT_PASS = "kHq3vW54%&jbqhuNBA"
-
 # Snapshot storage
 SNAPSHOT_DIR = Path("snapshots")
 LAST_SNAPSHOT = SNAPSHOT_DIR / "last_snapshot.json"
 SNAPSHOT_RETENTION = 30  # keep last 30 gzip snapshots
+HTTP_TIMEOUT = 20
+USER_AGENT = "portad-automation/1.0 (+https://github.com/)"
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -54,10 +53,26 @@ def load_env_file(path: str = ".env") -> None:
             os.environ.setdefault(key, val)
 
 
+def build_session() -> requests.Session:
+    """Create a session with retry/backoff and a consistent User-Agent."""
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
+
+
 def login(session: requests.Session, username: str, password: str) -> str:
     """Perform a single login and return the HTML of the landing page."""
     # Prime session with initial GET to set cookies
-    session.get(BASE_URL, timeout=20)
+    session.get(BASE_URL, timeout=HTTP_TIMEOUT)
 
     payload = {
         "login[username]": username,
@@ -69,7 +84,12 @@ def login(session: requests.Session, username: str, password: str) -> str:
         "login[isMobileApp]": "",
     }
 
-    resp = session.post(LOGIN_URL, data=payload, allow_redirects=True, timeout=20)
+    resp = session.post(
+        LOGIN_URL,
+        data=payload,
+        allow_redirects=True,
+        timeout=HTTP_TIMEOUT,
+    )
     resp.raise_for_status()
     return resp.text
 
@@ -100,7 +120,9 @@ def fetch_dashboard_html(session: requests.Session, user_id: str) -> str:
         "action": "display",
     }
     headers = {"X-Requested-With": "XMLHttpRequest"}
-    resp = session.post(AJAX_PERSON_URL, data=payload, headers=headers, timeout=20)
+    resp = session.post(
+        AJAX_PERSON_URL, data=payload, headers=headers, timeout=HTTP_TIMEOUT
+    )
     resp.raise_for_status()
 
     if resp.headers.get("Todoyu-Msginterdit") == "1":
@@ -210,10 +232,8 @@ def save_snapshot(data: dict) -> Path:
     SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     snap_path = SNAPSHOT_DIR / f"portad-dashboard-{ts}.json.gz"
-    with gzip.open(snap_path, "wt", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
-    with LAST_SNAPSHOT.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
+    _atomic_dump_json(snap_path, data, gzip_compress=True)
+    _atomic_dump_json(LAST_SNAPSHOT, data, gzip_compress=False)
     return snap_path
 
 
@@ -256,13 +276,16 @@ def send_pushover(message: str, title: str = "Portad dashboard update") -> None:
         "priority": 0,
     }
     try:
-        resp = requests.post(
-            "https://api.pushover.net/1/messages.json", data=payload, timeout=10
-        )
-        if resp.status_code != 200:
-            sys.stderr.write(
-                f"Pushover failed ({resp.status_code}): {resp.text[:200]}\n"
+        with build_session() as session:
+            resp = session.post(
+                "https://api.pushover.net/1/messages.json",
+                data=payload,
+                timeout=10,
             )
+            if resp.status_code != 200:
+                sys.stderr.write(
+                    f"Pushover failed ({resp.status_code}): {resp.text[:200]}\n"
+                )
     except Exception as exc:
         # non-fatal, but keep a trace
         sys.stderr.write(f"Pushover error: {exc}\n")
@@ -274,34 +297,167 @@ def notify_error(exc: Exception) -> None:
     sys.stderr.write(msg + "\n")
 
 
+def _stringify_value(val: Any, max_len: int = 120) -> str:
+    text = json.dumps(val, ensure_ascii=False)
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
+
+
+def _format_value(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, (list, dict)):
+        return _stringify_value(value)
+    return str(value)
+
+
+def _build_label_map(
+    entries: List[dict], label_key: str, fallback_prefix: str
+) -> Dict[str, dict]:
+    seen_counts: Dict[str, int] = {}
+    mapping: Dict[str, dict] = {}
+    for idx, entry in enumerate(entries):
+        raw_label = entry.get(label_key)
+        label = raw_label.strip() if isinstance(raw_label, str) else ""
+        if not label:
+            label = f"{fallback_prefix} {idx + 1}"
+        count = seen_counts.get(label, 0)
+        seen_counts[label] = count + 1
+        unique_label = label if count == 0 else f"{label} #{count + 1}"
+        mapping[unique_label] = entry
+    return mapping
+
+
+def _summarize_tile_changes(prev_tiles: List[dict], curr_tiles: List[dict]) -> List[str]:
+    lines: List[str] = []
+    prev_map = _build_label_map(prev_tiles, "label", "Tile")
+    curr_map = _build_label_map(curr_tiles, "label", "Tile")
+    keys = list(curr_map.keys()) + [k for k in prev_map if k not in curr_map]
+
+    for key in keys:
+        prev_tile = prev_map.get(key)
+        curr_tile = curr_map.get(key)
+        if prev_tile and curr_tile:
+            if prev_tile.get("value") != curr_tile.get("value"):
+                lines.append(
+                    f"📊 {key} : {_format_value(prev_tile.get('value'))} -> {_format_value(curr_tile.get('value'))}"
+                )
+            if prev_tile.get("percent") != curr_tile.get("percent"):
+                lines.append(
+                    f"📈 {key} % : {_format_value(prev_tile.get('percent'))} -> {_format_value(curr_tile.get('percent'))}"
+                )
+        elif curr_tile:
+            lines.append(
+                f"🆕 {key} : - -> {_format_value(curr_tile.get('value'))}"
+            )
+        elif prev_tile:
+            lines.append(
+                f"❌ {key} : {_format_value(prev_tile.get('value'))} -> -"
+            )
+    return lines
+
+
+def _summarize_table_changes(prev_tables: List[dict], curr_tables: List[dict]) -> List[str]:
+    lines: List[str] = []
+    prev_heads = [t.get("heading") for t in prev_tables]
+    curr_heads = [t.get("heading") for t in curr_tables]
+    if prev_heads != curr_heads:
+        lines.append(
+            f"🗂️ Tableaux : {_stringify_value(prev_heads, 80)} -> {_stringify_value(curr_heads, 80)}"
+        )
+
+    prev_map = _build_label_map(prev_tables, "heading", "Table")
+    curr_map = _build_label_map(curr_tables, "heading", "Table")
+    keys = list(curr_map.keys()) + [k for k in prev_map if k not in curr_map]
+    for key in keys:
+        prev_table = prev_map.get(key)
+        curr_table = curr_map.get(key)
+        if prev_table and curr_table:
+            prev_rows = len(prev_table.get("rows", []))
+            curr_rows = len(curr_table.get("rows", []))
+            if prev_rows != curr_rows:
+                lines.append(f"📄 {key} : {prev_rows} lignes -> {curr_rows} lignes")
+        elif curr_table:
+            curr_rows = len(curr_table.get("rows", []))
+            lines.append(f"📄 {key} : 0 lignes -> {curr_rows} lignes")
+        elif prev_table:
+            prev_rows = len(prev_table.get("rows", []))
+            lines.append(f"📄 {key} : {prev_rows} lignes -> 0 lignes")
+    return lines
+
+
+def _first_diff(prev: Any, curr: Any, path: str = "") -> tuple[str, Any, Any] | None:
+    if isinstance(prev, dict) and isinstance(curr, dict):
+        keys = sorted(set(prev) | set(curr), key=str)
+        for key in keys:
+            new_path = f"{path}.{key}" if path else str(key)
+            if key not in prev:
+                return new_path, None, curr[key]
+            if key not in curr:
+                return new_path, prev[key], None
+            diff = _first_diff(prev[key], curr[key], new_path)
+            if diff:
+                return diff
+        return None
+
+    if isinstance(prev, list) and isinstance(curr, list):
+        max_len = max(len(prev), len(curr))
+        for idx in range(max_len):
+            new_path = f"{path}[{idx}]" if path else f"[{idx}]"
+            if idx >= len(prev):
+                return new_path, None, curr[idx]
+            if idx >= len(curr):
+                return new_path, prev[idx], None
+            diff = _first_diff(prev[idx], curr[idx], new_path)
+            if diff:
+                return diff
+        return None
+
+    if prev != curr:
+        return path or "root", prev, curr
+    return None
+
+
 def summarize_changes(prev: dict | None, curr: dict) -> str:
     if prev is None:
         return "Première capture enregistrée."
 
     lines: List[str] = []
-    # Tiles comparison
-    prev_tiles = {t.get("label", f"tile{idx}"): t for idx, t in enumerate(prev.get("tiles", []))}
-    curr_tiles = {t.get("label", f"tile{idx}"): t for idx, t in enumerate(curr.get("tiles", []))}
-    for label, ct in curr_tiles.items():
-        pv = prev_tiles.get(label, {})
-        if pv.get("value") != ct.get("value"):
-            lines.append(f"📊 {label or 'Tile'} : {pv.get('value','-')} -> {ct.get('value','-')}")
-    # Table count / headings
-    prev_heads = [t.get("heading") for t in prev.get("tables", [])]
-    curr_heads = [t.get("heading") for t in curr.get("tables", [])]
-    if prev_heads != curr_heads:
-        lines.append("🗂️ Structure des tableaux modifiée.")
-    # Rows count per heading
-    prev_map = {t.get("heading"): len(t.get("rows", [])) for t in prev.get("tables", [])}
-    curr_map = {t.get("heading"): len(t.get("rows", [])) for t in curr.get("tables", [])}
-    for h, n in curr_map.items():
-        if h in prev_map and prev_map[h] != n:
-            lines.append(f"📄 {h or 'Table'} : {prev_map[h]} lignes -> {n} lignes")
+    lines.extend(_summarize_tile_changes(prev.get("tiles", []), curr.get("tiles", [])))
+    lines.extend(_summarize_table_changes(prev.get("tables", []), curr.get("tables", [])))
+
+    if prev.get("user_id") != curr.get("user_id"):
+        lines.append(
+            f"👤 user_id : {_format_value(prev.get('user_id'))} -> {_format_value(curr.get('user_id'))}"
+        )
 
     if not lines:
-        lines.append("Changements détectés (détails non résumés).")
-    # Limit to a few lines for notification readability
+        diff = _first_diff(prev, curr)
+        if diff:
+            path, before, after = diff
+            lines.append(f"Δ {path} : {_format_value(before)} -> {_format_value(after)}")
+        else:
+            lines.append("Changements détectés.")
     return "\n".join(lines[:6])
+
+
+def _atomic_dump_json(path: Path, data: dict, gzip_compress: bool = False) -> None:
+    """Write JSON atomically to avoid half-written snapshots."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    if gzip_compress:
+        with gzip.open(tmp_path, "wt", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+    else:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _is_login_page(html: str) -> bool:
+    """Heuristic to detect if the login page was returned (failed credentials)."""
+    return "login[username]" in html and "login[password]" in html
 
 
 def main() -> int:
@@ -315,22 +471,30 @@ def main() -> int:
 
     load_env_file()
 
-    username = os.getenv("PORTAD_USER", DEFAULT_USER)
-    password = os.getenv("PORTAD_PASS", DEFAULT_PASS)
+    username = os.getenv("PORTAD_USER")
+    password = os.getenv("PORTAD_PASS")
     if not username or not password:
         raise SystemExit("PORTAD_USER / PORTAD_PASS manquants (dans .env).")
 
     try:
-        with requests.Session() as session:
+        with build_session() as session:
             # 1) Login once
             landing_html = login(session, username, password)
 
             # 2) Get a page that contains the user id (if not already present)
             user_id = extract_user_id(landing_html)
+            if _is_login_page(landing_html) and not user_id:
+                raise RuntimeError("Login failed: formulaire de connexion renvoyé.")
             if not user_id:
-                display_page = session.get(DISPLAY_TABLEAU_PAGE, timeout=20)
+                display_page = session.get(
+                    DISPLAY_TABLEAU_PAGE, timeout=HTTP_TIMEOUT
+                )
                 display_page.raise_for_status()
                 user_id = extract_user_id(display_page.text)
+                if _is_login_page(display_page.text) and not user_id:
+                    raise RuntimeError(
+                        "Login failed: toujours sur la page de connexion après authentification."
+                    )
 
             if not user_id:
                 raise RuntimeError("Could not determine id_person_conn after login.")
