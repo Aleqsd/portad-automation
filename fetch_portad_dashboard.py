@@ -491,64 +491,70 @@ def main() -> int:
     if not username or not password:
         raise SystemExit("PORTAD_USER / PORTAD_PASS manquants (dans .env).")
 
+    session: requests.Session | None = None
     try:
-        with build_session() as session:
-            # 1) Login once
-            landing_html = login(session, username, password)
+        session = build_session()
 
-            # 2) Get a page that contains the user id (if not already present)
-            user_id = extract_user_id(landing_html)
-            if _is_login_page(landing_html) and not user_id:
-                raise RuntimeError("Login failed: formulaire de connexion renvoyé.")
-            if not user_id:
-                display_page = session.get(
-                    DISPLAY_TABLEAU_PAGE, timeout=HTTP_TIMEOUT
+        # 1) Login once
+        landing_html = login(session, username, password)
+
+        # 2) Get a page that contains the user id (if not already present)
+        user_id = extract_user_id(landing_html)
+        if _is_login_page(landing_html) and not user_id:
+            raise RuntimeError("Login failed: formulaire de connexion renvoyé.")
+        if not user_id:
+            display_page = session.get(DISPLAY_TABLEAU_PAGE, timeout=HTTP_TIMEOUT)
+            display_page.raise_for_status()
+            user_id = extract_user_id(display_page.text)
+            if _is_login_page(display_page.text) and not user_id:
+                raise RuntimeError(
+                    "Login failed: toujours sur la page de connexion après authentification."
                 )
-                display_page.raise_for_status()
-                user_id = extract_user_id(display_page.text)
-                if _is_login_page(display_page.text) and not user_id:
-                    raise RuntimeError(
-                        "Login failed: toujours sur la page de connexion après authentification."
-                    )
 
-            if not user_id:
-                raise RuntimeError("Could not determine id_person_conn after login.")
+        if not user_id:
+            raise RuntimeError("Could not determine id_person_conn after login.")
 
-            # 3) Fetch the tableau HTML fragment in one request
-            tableau_html = fetch_dashboard_html(session, user_id)
+        # 3) Fetch the tableau HTML fragment in one request
+        tableau_html = fetch_dashboard_html(session, user_id)
 
-            # 4) Parse with BeautifulSoup
-            soup = BeautifulSoup(tableau_html, "lxml")
-            data = {
-                "user_id": user_id,
-                "tiles": parse_tile_counters(soup),
-                "tables": parse_two_col_tables(soup),
-            }
+        # 4) Parse with BeautifulSoup
+        soup = BeautifulSoup(tableau_html, "lxml")
+        data = {
+            "user_id": user_id,
+            "tiles": parse_tile_counters(soup),
+            "tables": parse_two_col_tables(soup),
+        }
 
-            if args.simulate_change:
-                data["__simulated_change"] = datetime.now().isoformat()
+        if args.simulate_change:
+            data["__simulated_change"] = datetime.now().isoformat()
 
-            # Diff & notify
-            previous = load_last_snapshot()
-            changed = previous is None or diff_changed(previous, data)
-            snap_path = None
-            if changed:
-                snap_path = save_snapshot(data)
-                cleanup_old_snapshots()
-                if previous is not None:
-                    summary = summarize_changes(previous, data)
-                    message = build_notification_message(summary, snap_path)
-                    send_pushover(message, title="📈 Portad: changement détecté")
-            else:
-                # keep last_snapshot as-is; ensure at least baseline exists
-                if previous is None:
-                    save_snapshot(data)
+        # Diff & notify
+        previous = load_last_snapshot()
+        changed = previous is None or diff_changed(previous, data)
+        snap_path = None
+        if changed:
+            snap_path = save_snapshot(data)
+            cleanup_old_snapshots()
+            if previous is not None:
+                summary = summarize_changes(previous, data)
+                message = build_notification_message(summary, snap_path)
+                send_pushover(message, title="📈 Portad: changement détecté")
+        else:
+            # keep last_snapshot as-is; ensure at least baseline exists
+            if previous is None:
+                save_snapshot(data)
 
-            print(json.dumps(data, ensure_ascii=False, indent=2))
+        print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
         notify_error(exc)
         return 1
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

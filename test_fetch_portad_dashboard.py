@@ -264,5 +264,56 @@ class SessionAndAuthTests(unittest.TestCase):
                     fpd.main()
 
 
+class MainSessionLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.env_backup = dict(os.environ)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self.env_backup)
+
+    def _patch_credentials(self):
+        return patch.dict(
+            os.environ,
+            {"PORTAD_USER": "user@example.com", "PORTAD_PASS": "secret"},
+            clear=True,
+        )
+
+    def test_main_closes_session_on_success(self):
+        session = MagicMock()
+        session.close = MagicMock()
+
+        with self._patch_credentials(), patch("fetch_portad_dashboard.load_env_file"), patch(
+            "fetch_portad_dashboard.build_session", return_value=session
+        ), patch("fetch_portad_dashboard.login", return_value="<html></html>"), patch(
+            "fetch_portad_dashboard.extract_user_id", return_value="123"
+        ), patch(
+            "fetch_portad_dashboard.fetch_dashboard_html",
+            return_value="<div class='tile-counter'><h2>1</h2></div>",
+        ), patch("fetch_portad_dashboard.load_last_snapshot", return_value=None), patch(
+            "fetch_portad_dashboard.save_snapshot"
+        ), patch("fetch_portad_dashboard.cleanup_old_snapshots"), patch(
+            "fetch_portad_dashboard.send_pushover"
+        ):
+            result = fpd.main()
+
+        self.assertEqual(result, 0)
+        session.close.assert_called_once()
+
+    def test_main_closes_session_on_failure(self):
+        session = MagicMock()
+        session.close = MagicMock()
+
+        with self._patch_credentials(), patch("fetch_portad_dashboard.load_env_file"), patch(
+            "fetch_portad_dashboard.build_session", return_value=session
+        ), patch("fetch_portad_dashboard.login", side_effect=RuntimeError("boom")), patch(
+            "fetch_portad_dashboard.notify_error"
+        ) as notify_mock:
+            result = fpd.main()
+
+        self.assertEqual(result, 1)
+        session.close.assert_called_once()
+        notify_mock.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main()
