@@ -232,6 +232,147 @@ class SummarizeChangesTests(unittest.TestCase):
         self.assertIn("Tableaux", summary)
         self.assertIn("1 lignes -> 3 lignes", summary)
 
+    def test_summarize_changes_humanizes_notes_de_frais_path(self):
+        prev = {
+            "tiles": [],
+            "tables": [
+                {
+                    "heading": "Synthèse annuelle",
+                    "headers": ["Prestations", "col1"],
+                    "rows": [
+                        {"Prestations": "Notes de frais", "col1": "100 €"},
+                    ],
+                }
+            ],
+        }
+        curr = {
+            "tiles": [],
+            "tables": [
+                {
+                    "heading": "Synthèse annuelle",
+                    "headers": ["Prestations", "col1"],
+                    "rows": [
+                        {"Prestations": "Notes de frais", "col1": "250 €"},
+                    ],
+                }
+            ],
+        }
+
+        summary = fpd.summarize_changes(prev, curr)
+        self.assertIn("Notes de frais", summary)
+        self.assertNotIn("tables[0]", summary)
+
+    def test_summarize_changes_lists_new_releve_rows(self):
+        prev = {
+            "tiles": [],
+            "tables": [
+                {
+                    "heading": "Relevé de compte porté",
+                    "headers": ["Année", "Objet", "Disponible"],
+                    "rows": [
+                        {"Année": "Année", "Objet": "Objet", "Disponible": "Disponible"},
+                        {"Année": "2025", "Objet": "Ancien", "Disponible": "100"},
+                    ],
+                }
+            ],
+        }
+        curr = {
+            "tiles": [],
+            "tables": [
+                {
+                    "heading": "Relevé de compte porté",
+                    "headers": ["Année", "Objet", "Disponible"],
+                    "rows": [
+                        {"Année": "Année", "Objet": "Objet", "Disponible": "Disponible"},
+                        {"Année": "2025", "Objet": "Ancien", "Disponible": "100"},
+                        {"Année": "2025", "Objet": "Nouveau", "Disponible": "150"},
+                    ],
+                }
+            ],
+        }
+
+        summary = fpd.summarize_changes(prev, curr)
+        self.assertIn("3 lignes", summary)
+        self.assertIn("Nouveau", summary)
+
+    def test_summarize_changes_skips_header_like_new_rows(self):
+        prev = {
+            "tiles": [],
+            "tables": [
+                {
+                    "heading": "Relevé de compte porté",
+                    "headers": ["Année", "Objet"],
+                    "rows": [
+                        {"Année": "Année", "Objet": "Objet"},
+                    ],
+                }
+            ],
+        }
+        curr = {
+            "tiles": [],
+            "tables": [
+                {
+                    "heading": "Relevé de compte porté",
+                    "headers": ["Année", "Objet"],
+                    "rows": [
+                        {"Année": "Année", "Objet": "Objet"},
+                        {"Année": "Année", "Objet": "Objet"},  # header duplicated
+                    ],
+                }
+            ],
+        }
+
+        summary = fpd.summarize_changes(prev, curr)
+        self.assertIn("2 lignes", summary)
+        self.assertNotIn("➕", summary)
+
+
+class UtilityHelpersTests(unittest.TestCase):
+    def test_detect_new_rows_handles_duplicates(self):
+        prev = [{"a": 1}, {"a": 1}]
+        curr = [{"a": 1}, {"a": 1}, {"a": 1}]
+        new_rows = fpd._detect_new_rows(prev, curr)
+        self.assertEqual(len(new_rows), 1)
+        self.assertEqual(new_rows[0], {"a": 1})
+
+    def test_looks_like_header_row_true(self):
+        row = {"Année": "Année", "Disponible": "Disponible", "col1": ""}
+        self.assertTrue(fpd._looks_like_header_row(row))
+
+    def test_describe_table_row_prefers_releve_fields(self):
+        row = {
+            "Année": "2025",
+            "Mois": "Novembre",
+            "Date de valeur": "28/11/2025",
+            "Objet": "Facture X",
+            "Disponible": "1200,00",
+        }
+        text = fpd._describe_table_row(row, ["Année", "Objet", "Disponible"])
+        self.assertIn("Date de valeur", text)
+        self.assertIn("Objet", text)
+        self.assertIn("Disponible", text)
+
+    def test_humanize_diff_path_uses_heading_and_row_label(self):
+        prev = {
+            "tables": [
+                {
+                    "heading": "Synthèse annuelle",
+                    "headers": ["Prestations", "col1"],
+                    "rows": [
+                        {"Prestations": "Notes de frais", "col1": "100 €"},
+                        {"Prestations": "Autre", "col1": "200 €"},
+                    ],
+                }
+            ]
+        }
+        curr = prev
+        label = fpd._humanize_diff_path("tables[0].rows[1].col1", prev, curr)
+        self.assertEqual(label, "Synthèse annuelle – Autre")
+
+    def test_humanize_diff_path_returns_none_when_out_of_range(self):
+        prev = {"tables": []}
+        self.assertIsNone(fpd._humanize_diff_path("tables[2].rows[0].col1", prev, prev))
+
 
 class NotificationMessageTests(unittest.TestCase):
     def test_build_notification_message_uses_fallback_when_summary_blank(self):

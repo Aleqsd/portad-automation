@@ -14,6 +14,7 @@ import argparse
 import gzip
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -329,6 +330,71 @@ def _build_label_map(
     return mapping
 
 
+def _looks_like_header_row(row: Any) -> bool:
+    """Heuristic: a dict row whose values mostly repeat the keys/cols."""
+    if not isinstance(row, dict) or not row:
+        return False
+    matches = 0
+    total = 0
+    for key, val in row.items():
+        total += 1
+        if isinstance(val, str):
+            if val.strip() == key.strip() or (
+                key.lower().startswith("col") and val.strip() == ""
+            ):
+                matches += 1
+    return total > 0 and matches / total >= 0.7
+
+
+def _describe_table_row(row: Any, headers: List[str] | None = None) -> str:
+    """Compact textual description of a table row for notifications."""
+    if isinstance(row, dict):
+        preferred_keys = [
+            "Date de valeur",
+            "Objet",
+            "Mt Facturé",
+            "Règlement",
+            "Versement",
+            "Disponible",
+            "N° de facture",
+            "Mois",
+            "Année",
+        ]
+        items: List[str] = []
+        for key in preferred_keys:
+            if key in row:
+                val = row[key]
+                if isinstance(val, str) and val and val != key:
+                    items.append(f"{key}: {val}")
+        if not items:
+            for key, val in row.items():
+                if isinstance(val, str) and val and val != key:
+                    items.append(f"{key}: {val}")
+                if len(items) >= 4:
+                    break
+        return ", ".join(items) if items else _stringify_value(row, 200)
+    if isinstance(row, (list, tuple)):
+        compact = [str(v) for v in row if v not in ("", None)]
+        return " | ".join(compact) if compact else _stringify_value(row, 200)
+    return _stringify_value(row, 200)
+
+
+def _detect_new_rows(prev_rows: List[Any], curr_rows: List[Any]) -> List[Any]:
+    """Return rows present in curr_rows but not in prev_rows (multiset diff)."""
+    remaining = list(prev_rows)
+    new_rows: List[Any] = []
+    for row in curr_rows:
+        found = False
+        for idx, prev_row in enumerate(remaining):
+            if prev_row == row:
+                remaining.pop(idx)
+                found = True
+                break
+        if not found:
+            new_rows.append(row)
+    return new_rows
+
+
 def _summarize_tile_changes(prev_tiles: List[dict], curr_tiles: List[dict]) -> List[str]:
     lines: List[str] = []
     prev_map = _build_label_map(prev_tiles, "label", "Tile")
@@ -378,6 +444,18 @@ def _summarize_table_changes(prev_tables: List[dict], curr_tables: List[dict]) -
             curr_rows = len(curr_table.get("rows", []))
             if prev_rows != curr_rows:
                 lines.append(f"📄 {key} : {prev_rows} lignes -> {curr_rows} lignes")
+            heading = str(curr_table.get("heading") or prev_table.get("heading") or "")
+            heading_lc = heading.lower()
+            if curr_rows > prev_rows and "relevé" in heading_lc:
+                prev_rows_list = prev_table.get("rows", []) if isinstance(prev_table.get("rows", []), list) else []
+                curr_rows_list = curr_table.get("rows", []) if isinstance(curr_table.get("rows", []), list) else []
+                new_rows = _detect_new_rows(prev_rows_list, curr_rows_list)
+                for row in new_rows:
+                    if _looks_like_header_row(row):
+                        continue
+                    desc = _describe_table_row(row, curr_table.get("headers"))
+                    if desc:
+                        lines.append(f"➕ {heading} : {desc}")
         elif curr_table:
             curr_rows = len(curr_table.get("rows", []))
             lines.append(f"📄 {key} : 0 lignes -> {curr_rows} lignes")
@@ -387,10 +465,68 @@ def _summarize_table_changes(prev_tables: List[dict], curr_tables: List[dict]) -
     return lines
 
 
+_TABLE_PATH_RE = re.compile(r"tables\[(\d+)]\.rows\[(\d+)](?:\.([^.]+))?")
+
+
+def _humanize_diff_path(path: str, prev: dict, curr: dict) -> str | None:
+    """
+    Turn opaque paths (e.g., tables[0].rows[6].col1) into human-friendly labels
+    using table headings and row labels when possible.
+    """
+    match = _TABLE_PATH_RE.fullmatch(path)
+    if not match:
+        return None
+
+    table_idx, row_idx, col_key = match.groups()
+    t_idx = int(table_idx)
+    r_idx = int(row_idx)
+
+    tables = curr.get("tables") or prev.get("tables") or []
+    if not isinstance(tables, list) or t_idx >= len(tables):
+        return None
+    table = tables[t_idx]
+    if not isinstance(table, dict):
+        return None
+    heading = table.get("heading")
+    rows = table.get("rows", []) if isinstance(table.get("rows", []), list) else []
+    row = rows[r_idx] if r_idx < len(rows) else None
+
+    row_label: str | None = None
+    if isinstance(row, dict):
+        headers = table.get("headers", []) if isinstance(table.get("headers", []), list) else []
+        if headers:
+            first_header = headers[0]
+            label_val = row.get(first_header)
+            if isinstance(label_val, str) and label_val and label_val != first_header:
+                row_label = label_val
+        if not row_label:
+            for val in row.values():
+                if isinstance(val, str) and val and not val.lower().startswith("col"):
+                    row_label = val
+                    break
+    elif isinstance(row, (list, tuple)) and row:
+        first_val = row[0]
+        if isinstance(first_val, str) and first_val:
+            row_label = first_val
+
+    parts = []
+    if heading:
+        parts.append(str(heading))
+    if row_label:
+        parts.append(str(row_label))
+    if col_key and col_key not in ("col1", "col0"):
+        parts.append(col_key)
+    if parts:
+        return " – ".join(parts)
+    return None
+
+
 def _first_diff(prev: Any, curr: Any, path: str = "") -> tuple[str, Any, Any] | None:
     if isinstance(prev, dict) and isinstance(curr, dict):
         keys = sorted(set(prev) | set(curr), key=str)
         for key in keys:
+            if path == "" and isinstance(key, str) and key.startswith("__"):
+                continue  # skip internal/test keys at root
             new_path = f"{path}.{key}" if path else str(key)
             if key not in prev:
                 return new_path, None, curr[key]
@@ -437,7 +573,8 @@ def summarize_changes(prev: dict | None, curr: dict) -> str:
     diff = _first_diff(prev, curr)
     if diff:
         path, before, after = diff
-        diff_line = f"Δ {path} : {_format_value(before)} -> {_format_value(after)}"
+        friendly_path = _humanize_diff_path(path, prev, curr) or path
+        diff_line = f"Δ {friendly_path} : {_format_value(before)} -> {_format_value(after)}"
         if diff_line not in lines:
             lines.insert(0, diff_line)
     elif not lines:
@@ -446,14 +583,224 @@ def summarize_changes(prev: dict | None, curr: dict) -> str:
     return "\n".join(lines[:7])
 
 
-def build_notification_message(summary: str, snap_path: Path | None) -> str:
+def _normalize_amount(text: str | None) -> str:
+    if not text:
+        return "-"
+    return " ".join(str(text).replace("\xa0", " ").split())
+
+
+def _get_tile_value(tiles: List[dict], label: str) -> str | None:
+    for tile in tiles:
+        if tile.get("label") == label:
+            return tile.get("value")
+    return None
+
+
+def _summarize_cash(prev_tiles: List[dict], curr_tiles: List[dict]) -> str | None:
+    dispo_before = _get_tile_value(prev_tiles, "Disponible")
+    dispo_after = _get_tile_value(curr_tiles, "Disponible")
+    dispo_prev_before = _get_tile_value(prev_tiles, "Dispo + Dispo prev")
+    dispo_prev_after = _get_tile_value(curr_tiles, "Dispo + Dispo prev")
+
+    parts: List[str] = []
+    if dispo_before != dispo_after and dispo_after is not None:
+        parts.append(
+            f"Disponible : {_normalize_amount(dispo_before)} -> {_normalize_amount(dispo_after)}"
+        )
+    if dispo_prev_before != dispo_prev_after and dispo_prev_after is not None:
+        parts.append(
+            f"Dispo+Prev : {_normalize_amount(dispo_prev_before)} -> {_normalize_amount(dispo_prev_after)}"
+        )
+    if not parts:
+        return None
+    return "💰 " + " (".join(parts) + ("" if len(parts) == 1 else ")")
+
+
+def _table_by_heading(tables: List[dict], needle: str) -> dict | None:
+    for table in tables:
+        heading = str(table.get("heading") or "")
+        if needle.lower() in heading.lower():
+            return table
+    return None
+
+
+def _row_maps(table: dict) -> tuple[dict, dict]:
+    rows = table.get("rows", []) if isinstance(table.get("rows", []), list) else []
+    headers = table.get("headers", []) if isinstance(table.get("headers", []), list) else []
+    key_col = headers[0] if headers else None
+    val_col = headers[1] if len(headers) > 1 else None
+    labels: dict = {}
+    values: dict = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if key_col and key_col in row and row[key_col] and row[key_col] != key_col:
+            label = row[key_col]
+        else:
+            # fallback: first non-empty string value
+            label = next((v for v in row.values() if isinstance(v, str) and v), None)
+        if not label:
+            continue
+        labels[label] = row
+        if val_col and val_col in row:
+            values[label] = row[val_col]
+        elif len(headers) >= 2:
+            # try second column name if different
+            second = headers[1]
+            values[label] = row.get(second, "")
+        else:
+            # grab any other non-empty value
+            other = next((v for k, v in row.items() if isinstance(v, str) and v and k != key_col), "")
+            values[label] = other
+    return labels, values
+
+
+def _summarize_synthese(prev_tables: List[dict], curr_tables: List[dict]) -> str | None:
+    prev_table = _table_by_heading(prev_tables, "Synthèse annuelle") if prev_tables else None
+    curr_table = _table_by_heading(curr_tables, "Synthèse annuelle") if curr_tables else None
+    if not curr_table:
+        return None
+
+    prev_rows = prev_table.get("rows", []) if isinstance(prev_table, dict) else []
+    curr_rows = curr_table.get("rows", []) if isinstance(curr_table, dict) else []
+    delta_rows = len(curr_rows) - len(prev_rows)
+
+    prev_labels, prev_values = _row_maps(prev_table or {})
+    curr_labels, curr_values = _row_maps(curr_table)
+
+    changes: List[str] = []
+    for label, after in curr_values.items():
+        before = prev_values.get(label)
+        if before is None:
+            changes.append(f"{label} : +{_normalize_amount(after)}")
+        elif before != after:
+            changes.append(
+                f"{label} : {_normalize_amount(before)} -> {_normalize_amount(after)}"
+            )
+
+    if not changes and delta_rows == 0:
+        return None
+
+    row_part = "" if delta_rows == 0 else f"{('+' if delta_rows > 0 else '')}{delta_rows} ligne{'s' if abs(delta_rows) != 1 else ''}"
+    change_part = "; ".join(changes[:3])  # keep short
+
+    pieces = [p for p in (row_part, change_part) if p]
+    payload = " – ".join(pieces)
+    return f"📊 Synthèse annuelle : {payload}" if payload else None
+
+
+def _format_releve_row(row: dict) -> str:
+    def _truncate(text: str, max_len: int = 80) -> str:
+        text = text.strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 3] + "..."
+
+    date = row.get("Date de valeur") or row.get("Date") or ""
+    objet = _truncate(str(row.get("Objet", ""))) if row.get("Objet") else ""
+    activ = row.get("N°Activité") or row.get("REF. ACTIVITE") or ""
+    versement = row.get("Versement") or ""
+    dispo = row.get("Disponible") or ""
+    parts = []
+    if versement:
+        parts.append(f"versement {versement}")
+    if dispo:
+        parts.append(f"disp. {dispo}")
+    detail = "; ".join(parts) if parts else None
+    head = date
+    if objet:
+        head = f"{date} – {objet}" if date else objet
+    if activ:
+        head = f"{head} ({activ})" if head else activ
+    if detail:
+        return f"• {head} : {detail}"
+    return f"• {head}" if head else "• Ligne ajoutée"
+
+
+def _summarize_releve(prev_tables: List[dict], curr_tables: List[dict]) -> List[str]:
+    lines: List[str] = []
+    prev_table = _table_by_heading(prev_tables, "Relevé") if prev_tables else None
+    curr_table = _table_by_heading(curr_tables, "Relevé") if curr_tables else None
+    if not curr_table:
+        return lines
+
+    prev_rows = prev_table.get("rows", []) if isinstance(prev_table, dict) else []
+    curr_rows = curr_table.get("rows", []) if isinstance(curr_table, dict) else []
+    delta = len(curr_rows) - len(prev_rows)
+    if delta != 0:
+        lines.append(f"📈 {curr_table.get('heading', 'Relevé')} : {len(prev_rows)} lignes -> {len(curr_rows)} lignes")
+
+    new_rows = _detect_new_rows(prev_rows if isinstance(prev_rows, list) else [], curr_rows if isinstance(curr_rows, list) else [])
+    pretty_rows = []
+    for row in new_rows:
+        if isinstance(row, dict) and not _looks_like_header_row(row):
+            pretty_rows.append(_format_releve_row(row))
+    lines.extend(pretty_rows)
+    return lines
+
+
+def _summarize_note_frais(prev_tables: List[dict], curr_tables: List[dict]) -> List[str]:
+    lines: List[str] = []
+    prev_table = _table_by_heading(prev_tables, "Note de frais") if prev_tables else None
+    curr_table = _table_by_heading(curr_tables, "Note de frais") if curr_tables else None
+    if not curr_table:
+        return lines
+    prev_rows = prev_table.get("rows", []) if isinstance(prev_table, dict) else []
+    curr_rows = curr_table.get("rows", []) if isinstance(curr_table, dict) else []
+    new_rows = _detect_new_rows(prev_rows if isinstance(prev_rows, list) else [], curr_rows if isinstance(curr_rows, list) else [])
+    for row in new_rows:
+        if not isinstance(row, dict) or _looks_like_header_row(row):
+            continue
+        name = row.get("NOM DU FICHIER") or row.get("col1") or "fichier"
+        mois = row.get("MOIS")
+        annee = row.get("ANNEE")
+        ref = row.get("REF. ACTIVITE") or row.get("N°Activité")
+        meta_parts = [p for p in (mois, annee) if p]
+        if row.get("TYPE"):
+            meta_parts.append(row["TYPE"])
+        if ref:
+            meta_parts.append(f"ref {ref}")
+        meta = ", ".join(meta_parts)
+        if meta:
+            lines.append(f"📂 Note de frais : nouveau fichier {name} ({meta})")
+        else:
+            lines.append(f"📂 Note de frais : nouveau fichier {name}")
+    return lines
+
+
+def _strip_simulated_line(lines: List[str]) -> List[str]:
+    return [ln for ln in lines if "__simulated_change" not in ln]
+
+
+def build_notification_message(
+    summary: str, snap_path: Path | None, prev: dict | None = None, curr: dict | None = None
+) -> str:
     """Normalize and trim the notification payload shown by Pushover."""
-    summary_lines = [line.strip() for line in summary.splitlines() if line.strip()]
-    if not summary_lines:
-        summary_lines = ["Changement détecté (détails indisponibles)."]
+    if prev is not None and curr is not None:
+        lines: List[str] = []
+        cash_line = _summarize_cash(prev.get("tiles", []), curr.get("tiles", []))
+        if cash_line:
+            lines.append(cash_line)
+
+        synth_line = _summarize_synthese(prev.get("tables", []), curr.get("tables", []))
+        if synth_line:
+            lines.append(synth_line)
+
+        lines.extend(_summarize_releve(prev.get("tables", []), curr.get("tables", [])))
+        lines.extend(_summarize_note_frais(prev.get("tables", []), curr.get("tables", [])))
+
+        # Fallback to original summary if nothing produced
+        if not lines:
+            lines = [line.strip() for line in summary.splitlines() if line.strip()]
+    else:
+        lines = [line.strip() for line in summary.splitlines() if line.strip()]
+
+    lines = _strip_simulated_line(lines)
+    if not lines:
+        lines = ["Changement détecté (détails indisponibles)."]
     if snap_path is not None:
-        summary_lines.append(f"📁 {snap_path.name}")
-    message = "\n".join(summary_lines)
+        lines.append(f"📁 {snap_path.name}")
+    message = "\n".join(lines)
     return message[:1024]  # Pushover message limit is 1024 chars
 
 
@@ -537,7 +884,7 @@ def main() -> int:
             cleanup_old_snapshots()
             if previous is not None:
                 summary = summarize_changes(previous, data)
-                message = build_notification_message(summary, snap_path)
+                message = build_notification_message(summary, snap_path, previous, data)
                 send_pushover(message, title="📈 Portad: changement détecté")
         else:
             # keep last_snapshot as-is; ensure at least baseline exists
